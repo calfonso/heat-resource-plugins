@@ -1,0 +1,84 @@
+heat_template_version: 2013-05-23
+description: Template for setting up an AutoScaled OpenShift Enterprise environment
+parameters:
+  key_name:
+    description: Name of an existing keypair to enable SSH access to the instances
+    type: string
+  image:
+    description: The image to instantiate
+    type: string
+    default: RHEL65-x86_64
+  flavor:
+    description: Flavor of servers
+    type: String
+    default: "m1.large"
+    allowed_values: [m1.small, m1.medium, m1.large, m1.xlarge]
+  private_net_id:
+    type: string
+    description: ID of private network into which servers get deployed
+  private_subnet_id:
+    type: string
+    description: ID of private sub network into which servers get deployed
+
+resources:
+  security_group:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Standard firewall rules
+      SecurityGroupIngress:
+      - {IpProtocol: udp, FromPort: '53', ToPort: '53', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '1', ToPort: '65535', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: icmp, FromPort: '-1', ToPort: '-1', CidrIp: 0.0.0.0/0}
+  
+  server_port:
+    type: OS::Neutron::Port
+    properties:
+      security_groups: [{ get_resource: security_group }]
+      network_id: { get_param: private_net_id }
+      fixed_ips:
+        - subnet_id: { get_param: private_subnet_id }
+
+  launch_config:
+    type: Nova::AutoScaling::LaunchConfiguration
+    properties:
+      name: launch_config
+      image: {get_param: image}
+      flavor: {get_param: flavor}
+      key_name: {get_param: key_name}
+      networks:
+        - port: {get_resource: server_port}
+      security_groups: [{ get_resource: security_group }]
+      user_data:
+     
+  scale_group:
+    type: Nova::AutoScaling::AutoScalingServerGroup
+    properties:
+      min_size: '1'
+      max_size: '3'
+      launch_configuration_name: {get_resource: launch_config}
+
+  scale_up:
+    type: Nova::AutoScaling::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      name: {get_resource: scale_group}
+      scaling_adjustment: 1
+
+  scale_up_alarm:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: scale up alarm
+      meter_name: blarg
+      statistic: count
+      period: '1'
+      evaluation_periods: '1'
+      threshold: '1'
+      alarm_actions:
+      - {get_attr: [scale_up, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.groupname': {get_resource: 'scale_group'}}
+      comparison_operator: gt
+
+outputs:
+  public_ip:
+    description: Alarm url to trigger scaleup
+    value: {get_attr: [scale_up, alarm_url]}

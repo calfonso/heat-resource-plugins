@@ -29,6 +29,41 @@ from heat.engine.resources import server
 from heat.db.sqlalchemy import api as db_api
 from heat.common import exception
 
+from heat.openstack.common import log as logging
+from heat.openstack.common.gettextutils import _
+from heat.openstack.common import timeutils
+
+logger = logging.getLogger(__name__)
+
+class CooldownMixin(object):
+    '''
+    Utility class to encapsulate Cooldown related logic which is shared
+    between AutoScalingGroup and ScalingPolicy
+    '''
+    def _cooldown_inprogress(self):
+        inprogress = False
+        try:
+            # Negative values don't make sense, so they are clamped to zero
+            cooldown = max(0, int(self.properties['cooldown']))
+        except TypeError:
+            # If not specified, it will be None, same as cooldown == 0
+            cooldown = 0
+
+        metadata = self.metadata
+        if metadata and cooldown != 0:
+            last_adjust = metadata.keys()[0]
+            if not timeutils.is_older_than(last_adjust, cooldown):
+                inprogress = True
+        return inprogress
+
+    def _cooldown_timestamp(self, reason):
+        # Save resource metadata with a timestamp and reason
+        # If we wanted to implement the AutoScaling API like AWS does,
+        # we could maintain event history here, but since we only need
+        # the latest event for cooldown, just store that for now
+        metadata = {timeutils.strtime(): reason}
+        self.metadata = metadata
+
 class ServerGroup(stack_resource.StackResource):
     tags_schema = {'Key': {'Type': 'String',
                            'Required': True},
@@ -168,7 +203,7 @@ class ServerGroup(stack_resource.StackResource):
         conf_name = self.properties['launch_configuration_name']
         conf = self.stack.resource_by_refid(conf_name)
         instance_definition = copy.deepcopy(conf.t)
-        instance_definition['type'] = 'OS::Nova::Server'
+        instance_definition['Type'] = 'OS::Nova::Server'
         # resolve references within the context of this stack.
         fully_parsed = self.stack.resolve_runtime_data(instance_definition)
 
@@ -183,9 +218,12 @@ class ServerGroup(stack_resource.StackResource):
 
         When shrinking, the newest instances will be removed.
         """
+        logger.info("Resizing the ServerGroup to %s " % new_capacity)
         new_template = self._create_template(new_capacity)
+        logger.info("Template looks like %s " % new_template)
         try:
             updater = self.update_with_template(new_template, {})
+            logger.info("updater is %s " % updater)
             updater.run_to_completion()
             self.check_update_complete(updater)
         finally:
@@ -238,7 +276,7 @@ class ServerGroup(stack_resource.StackResource):
         }
 
 
-class AutoScalingServerGroup(ServerGroup, autoscaling.CooldownMixin):
+class AutoScalingServerGroup(ServerGroup, CooldownMixin):
     tags_schema = {'Key': {'Type': 'String',
                            'Required': True},
                    'Value': {'Type': 'String',
@@ -363,6 +401,8 @@ class AutoScalingServerGroup(ServerGroup, autoscaling.CooldownMixin):
             return
 
         capacity = len(self.get_instances())
+        logger.info("Checking group capacity and it's currently %d " % capacity)
+        logger.info("Adjustment type is %s " % adjustment_type)
         if adjustment_type == 'change_in_capacity':
             new_capacity = capacity + adjustment
         elif adjustment_type == 'exact_capacity':
@@ -411,7 +451,7 @@ class LaunchConfiguration(resource.Resource):
                              'Required': True}}
     properties_schema = server.Server.properties_schema
 
-class ScalingPolicy(signal_responder.SignalResponder, autoscaling.CooldownMixin):
+class ScalingPolicy(signal_responder.SignalResponder, CooldownMixin):
     properties_schema = {
         'name': {
             'Type': 'String',
@@ -476,7 +516,7 @@ class ScalingPolicy(signal_responder.SignalResponder, autoscaling.CooldownMixin)
                         (self.name, self.properties['cooldown']))
             return
 
-        asgn_id = self.properties['group']
+        asgn_id = self.properties['name']
         group = self.stack.resource_by_refid(asgn_id)
 
         logger.info('%s Alarm, adjusting Group %s by %s' %
